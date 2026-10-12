@@ -226,9 +226,16 @@ func (r *Role) Run(ctx context.Context) error {
 // their own lifecycle after readiness. A cancellation already observed before
 // the callback suppresses it. If ready panics, all barrier workers are canceled
 // and joined before the panic continues.
+//
+// From the start, and for as long as it runs, the Role re-sends in the
+// background the cleanup acknowledgements it owes the arbiter
+// (Config.CleanupAckResendInterval). Startup does not wait for them: the purge
+// gate holds only the tables they belong to, including in the startup pass.
 func (r *Role) RunWithReady(ctx context.Context, ready func()) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stopResender := r.startCleanupAckResender(runCtx)
+	defer stopResender()
 	// The periodic verifier first fires after an interval. Ensure before
 	// Prepare so startup convergence never touches ClickHouse in an unverified
 	// protocol-table state, including when Run is called without Register.
@@ -606,7 +613,9 @@ func (r *Role) promotionLock(k partitionKey) *sync.Mutex {
 // dispatchPromotionCommand runs one promotion subscription command. A failed
 // command is returned so the subscription redelivers it, and logged at error
 // level first: without the log a wedged promotion retried every few seconds
-// with no trace on the source.
+// with no trace on the source. A cleanup the arbiter already acknowledged is
+// not redelivered; when only clearing its owed acknowledgement failed, the log
+// says that the background resender retries it.
 func (r *Role) dispatchPromotionCommand(ctx context.Context, cmd *pb.PromotionCommand) error {
 	if cmd == nil {
 		return nil
@@ -621,7 +630,13 @@ func (r *Role) dispatchPromotionCommand(ctx context.Context, cmd *pb.PromotionCo
 		}
 	case *pb.PromotionCommand_Cleanup:
 		if err = r.handleCleanup(ctx, m.Cleanup, cmd.GetAuthorityJws()); err != nil {
-			r.d.Logger.Error("unsafe cleanup failed; the subscription redelivers it",
+			msg := "unsafe cleanup failed; the subscription redelivers it"
+			if errors.Is(err, errOwedAckNotCleared) {
+				// The arbiter has the acknowledgement and does not redeliver the
+				// cleanup; only the background resender clears the owed entry.
+				msg = "unsafe cleanup acknowledged, but clearing its owed acknowledgement failed; the background resender retries it"
+			}
+			r.d.Logger.Error(msg,
 				"promotion_seq", m.Cleanup.GetPromotionSeq(), "rejected_block_seq", m.Cleanup.GetRejectedBlockSeq(),
 				"table", m.Cleanup.GetTableId(), "partition", m.Cleanup.GetPartitionId(), "err", err)
 		}
