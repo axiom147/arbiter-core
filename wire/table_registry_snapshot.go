@@ -122,6 +122,12 @@ type TableRegistrySnapshot struct {
 	// SeededIndexers lists, ascending, the SI indexers whose Legacy seed is
 	// recorded; nil before the activation (Seeded keeps the founding flag).
 	SeededIndexers []uint64
+	// QuarantinedIndexers lists, ascending, the SI indexers whose host must
+	// refuse its own tables (housegate spec 2026-10-10 §7.4, §7.5, §10; plan
+	// S2-A amendment A32): those whose track is quarantined, or that were
+	// released with rejected parts not yet cleaned. nil before the tracks
+	// activation and while none is. Every committed change bumps Version.
+	QuarantinedIndexers []uint64
 }
 
 // Live mirrors arbiter's TableRegistryView.Live: the newest incarnation of key
@@ -204,6 +210,26 @@ func signedClaimsFromPB(m *pb.TableRegistrySnapshot) ([]arbiter.SIIndexerEntry, 
 	return entries, seeded, nil
 }
 
+// quarantinedFromPB decodes quarantined_indexers: ascending without
+// duplicates, and every id enrolled, like seeded_indexers. A quarantine
+// requires an si_indexers entry and si_indexers is append-only (an entry is
+// never removed), so an id without an entry is a corrupt view, refused like an
+// unknown status. quarantined_indexers itself is not append-only: an id leaves
+// it once a release is followed by the cleanup of the track's rejected parts
+// (amendment A32).
+func quarantinedFromPB(m *pb.TableRegistrySnapshot, entries []arbiter.SIIndexerEntry) ([]uint64, error) {
+	ids := mapSlice(m.GetQuarantinedIndexers(), func(id uint64) uint64 { return id })
+	for i, id := range ids {
+		if i > 0 && ids[i-1] >= id {
+			return nil, fmt.Errorf("table registry snapshot: quarantined_indexers must be ascending without duplicates")
+		}
+		if !slices.ContainsFunc(entries, func(e arbiter.SIIndexerEntry) bool { return e.IndexerID == id }) {
+			return nil, fmt.Errorf("table registry snapshot: quarantined indexer %d has no si_indexers entry", id)
+		}
+	}
+	return ids, nil
+}
+
 // TableRegistrySnapshotFromPB decodes a snapshot. Every status and origin must
 // be a known, specified value and every retire reason a known value; the
 // incarnations must be numbered 1..n in order.
@@ -229,6 +255,9 @@ func TableRegistrySnapshotFromPB(m *pb.TableRegistrySnapshot) (TableRegistrySnap
 		return TableRegistrySnapshot{}, err
 	}
 	out.SIIndexers, out.SeededIndexers = entries, seeded
+	if out.QuarantinedIndexers, err = quarantinedFromPB(m, entries); err != nil {
+		return TableRegistrySnapshot{}, err
+	}
 	for i, inc := range m.GetIncarnations() {
 		if inc.GetSeq() != uint64(i)+1 {
 			return TableRegistrySnapshot{}, fmt.Errorf("table registry snapshot: incarnation %d has seq %d", i+1, inc.GetSeq())
@@ -276,9 +305,10 @@ func TableRegistrySnapshotToPB(s TableRegistrySnapshot) *pb.TableRegistrySnapsho
 		Params: TableRegistryParamsToPB(&params), Version: s.Version, Seeded: s.Seeded,
 		Cursor: &pb.TableRegistryCursor{BlockNumber: s.Cursor.BlockNumber, BlockHash: s.Cursor.BlockHash,
 			LogIndex: s.Cursor.LogIndex, BlockComplete: s.Cursor.BlockComplete},
-		ClientLanes:    ClientLaneParamsToPB(s.ClientLanes),
-		SiIndexers:     SIIndexerEntriesToPB(s.SIIndexers),
-		SeededIndexers: mapSlice(s.SeededIndexers, func(id uint64) uint64 { return id }),
+		ClientLanes:         ClientLaneParamsToPB(s.ClientLanes),
+		SiIndexers:          SIIndexerEntriesToPB(s.SIIndexers),
+		SeededIndexers:      mapSlice(s.SeededIndexers, func(id uint64) uint64 { return id }),
+		QuarantinedIndexers: mapSlice(s.QuarantinedIndexers, func(id uint64) uint64 { return id }),
 	}
 	for _, inc := range s.Incarnations {
 		out.Incarnations = append(out.Incarnations, &pb.TableIncarnation{

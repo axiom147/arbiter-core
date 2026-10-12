@@ -22,8 +22,27 @@ func (r *Role) handleCleanup(ctx context.Context, m *pb.UnsafeCleanup, jws strin
 	}
 	if err := r.requireOwned(cmd.TableID); err != nil {
 		r.d.Logger.Warn("ignoring a cleanup for a table this SNode does not own",
-			"promotion_seq", cmd.PromotionSeq, "table", cmd.TableID, "err", err)
+			"promotion_seq", cmd.PromotionSeq, "rejected_block_seq", cmd.RejectedBlockSeq, "table", cmd.TableID, "err", err)
 		return nil
+	}
+	// A rejected-part cleanup (rejected_block_seq b, promotion_seq 0) names
+	// candidate parts of a Rejected block that were never promoted (housegate
+	// spec 2026-10-10 §7.5, plan S2-A clarification C4). Nothing here compares
+	// promotion_seq with the partition watermark, so they are dropped like any
+	// other cleanup. Fail closed before the first DROP when the command carries
+	// a promotion_seq as well (a part a promotion applied has already left
+	// UnpromotedSums, and the accounting below would subtract it a second time),
+	// or when a part is not of the command's table and partition, has no name,
+	// or was recorded by intake with another row LtHash than the command names;
+	// the DROPs, the accounting, RecordCleanup and the acknowledgement then all
+	// use the command's partition key. A promotion cleanup takes none of this:
+	// its empty part_name still fails in the middle of the DROPs.
+	k := partitionKey{Table: cmd.TableID, Partition: cmd.PartitionID}
+	rejected := cmd.RejectedBlockSeq != 0
+	if rejected {
+		if err := r.state.CheckRejectedParts(k, cmd.PromotionSeq, cmd.Parts); err != nil {
+			return fmt.Errorf("rejected-part cleanup for block %d: %w", cmd.RejectedBlockSeq, err)
+		}
 	}
 	table := CHTableName(cmd.TableID)
 	for _, p := range cmd.Parts {
@@ -36,16 +55,28 @@ func (r *Role) handleCleanup(ctx context.Context, m *pb.UnsafeCleanup, jws strin
 			return fmt.Errorf("drop part %s: %w", p.PartName, err)
 		}
 	}
+	// RecordCleanup below is a no-op for rejected parts: they never entered
+	// PromotedUnsafeParts. Their recorded LtHash leaves UnpromotedSums instead,
+	// after the DROPs so that a redelivery repairs a crash in between, and the
+	// purge gate (registry.go) and the diagnostic source-claim root (view.go)
+	// stop counting the dropped rows.
+	if rejected {
+		if err := r.state.RemoveRejectedParts(k, cmd.PromotionSeq, cmd.Parts); err != nil {
+			return fmt.Errorf("journal rejected parts: %w", err)
+		}
+	}
 	names := make([]string, 0, len(cmd.Parts))
 	for _, p := range cmd.Parts {
 		names = append(names, p.PartName)
 	}
-	if err := r.state.RecordCleanup(partitionKey{Table: cmd.TableID, Partition: cmd.PartitionID}, names); err != nil {
+	if err := r.state.RecordCleanup(k, names); err != nil {
 		return fmt.Errorf("journal cleanup: %w", err)
 	}
+	// The acknowledgement echoes rejected_block_seq inside the signed body.
 	ack := arbiter.CleanupAck{
 		NodeID: r.cfg.NodeID, PromotionSeq: cmd.PromotionSeq,
 		TableID: cmd.TableID, PartitionID: cmd.PartitionID,
+		RejectedBlockSeq: cmd.RejectedBlockSeq,
 	}
 	return r.sendCleanupAck(ctx, ack)
 }
