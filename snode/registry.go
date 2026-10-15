@@ -94,9 +94,13 @@ func (r *Role) requireAdmissible(tableID, schemaHash string) error {
 }
 
 // TableReady reports whether this SNode's hg_* tables for tableID's current
-// incarnation exist and verify (tableset.Reconciler.Ready). An embedding host
-// reports a table Active only when the registry says Active and this is true.
-func (r *Role) TableReady(tableID string) bool { return r.tables.Ready(tableID) }
+// incarnation exist and verify (tableset.Reconciler.Ready) and, in owner
+// audit repair mode, whether the table's hg_safe passed its audit
+// (OwnerAuditClean). An embedding host reports a table Active only when the
+// registry says Active and this is true; otherwise it answers Pending.
+func (r *Role) TableReady(tableID string) bool {
+	return r.tables.Ready(tableID) && r.OwnerAuditClean(tableID)
+}
 
 // TableSetStats returns the reconciler's metrics for the host to export.
 func (r *Role) TableSetStats() tableset.Stats {
@@ -189,16 +193,21 @@ func (st *stateStore) quiescent(table string) (bool, error) {
 // hg_unsafe numbers its parts from scratch, and an old record under a reused
 // part name would refuse or swallow its intake.
 func (r *Role) forgetDroppedTable(_ context.Context, tableID string) error {
-	return r.state.ForgetTable(tableID)
+	if err := r.state.ForgetTable(tableID); err != nil {
+		return err
+	}
+	r.audit.forgetTable(tableID)
+	return nil
 }
 
 // ForgetTable durably removes every BaseRoots, BaseSnapshotIDs,
-// UnpromotedSums, LastAcks and IntakeParts entry of table in one state write;
-// watermarks stay, because promotion seqs are global. It is idempotent (no
-// entry, no write). It refuses while the table still has promotion or cleanup
-// work (the purge gate's quiescence): an unresolved intent, a promoted part
-// awaiting cleanup, unpromoted rows or a cleanup acknowledgement the arbiter
-// has not accepted are never discarded silently.
+// UnpromotedSums, LastAcks, AckedSafeInventories and IntakeParts entry of
+// table in one state write; watermarks stay, because promotion seqs are
+// global. It is idempotent (no entry, no write). It refuses while the table
+// still has promotion or cleanup work (the purge gate's quiescence): an
+// unresolved intent, a promoted part awaiting cleanup, unpromoted rows or a
+// cleanup acknowledgement the arbiter has not accepted are never discarded
+// silently.
 func (st *stateStore) ForgetTable(table string) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -246,6 +255,7 @@ func (st *stateStore) ForgetTable(table string) error {
 	forget(slices.Collect(maps.Keys(next.LastAcks)), func(ks string) { delete(next.LastAcks, ks) })
 	forget(slices.Collect(maps.Keys(next.IntakeParts)), func(ks string) { delete(next.IntakeParts, ks) })
 	forget(slices.Collect(maps.Keys(next.PromotedUnsafeParts)), func(ks string) { delete(next.PromotedUnsafeParts, ks) })
+	forget(slices.Collect(maps.Keys(next.AckedSafeInventories)), func(ks string) { delete(next.AckedSafeInventories, ks) })
 	if !changed {
 		return nil
 	}
